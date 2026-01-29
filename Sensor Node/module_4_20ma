@@ -1,0 +1,167 @@
+# module_4_20ma.py
+#
+# Python driver for the M5Stack 4–20 mA (AIN4-20mA) I2C module
+#
+# Requires: smbus2  ->  pip install smbus2
+#
+# Notes:
+# - This module often DOES NOT like SMBus "read_byte_data" style reads.
+# - We therefore use an I2C "write register pointer, then read" sequence via i2c_rdwr,
+#   which matches what worked for you with:
+#     i2ctransfer -y 1 w1@0x55 0xFE r1
+#
+# Default address: 0x55
+
+from __future__ import annotations
+
+import time
+from typing import List
+
+from smbus2 import SMBus, i2c_msg
+
+# --- Constants (from M5Stack firmware convention) ---
+MODULE_4_20MA_ADDR = 0x55
+
+# Base registers (each channel typically uses 2 bytes, little-endian)
+MODULE_4_20MA_ADC_12BIT_REG = 0x00  # ADC 12-bit raw (stored in 16-bit)
+MODULE_4_20MA_CURRENT_REG = 0x20    # Current reading (raw 16-bit)
+MODULE_4_20MA_CAL_REG = 0x30        # Calibration values (raw 16-bit)
+
+FIRMWARE_VERSION_REG = 0xFE
+I2C_ADDRESS_REG = 0xFF
+
+
+class Module420mA:
+    """
+    Driver for the M5Stack AIN4-20mA I2C module.
+
+    Typical wiring (Raspberry Pi):
+    - SDA: GPIO2 / pin 3
+    - SCL: GPIO3 / pin 5
+    - GND common between Pi and module
+    - Power module via 5V (Pi pin 2/4) if using Grove 5V
+    """
+
+    def __init__(self, bus: int = 1, addr: int = MODULE_4_20MA_ADDR):
+        """
+        bus : I2C bus number (Pi typically 1)
+        addr: I2C address of the module (default 0x55)
+        """
+        self.bus_num = bus
+        self.addr = addr
+        self.bus = SMBus(bus)
+
+    # ----------------- Low-level helpers -----------------
+
+    def _write_bytes(self, reg: int, data: List[int]) -> None:
+        """Write bytes to a register (reg + payload)."""
+        if not (0 <= reg <= 0xFF):
+            raise ValueError("Register must be 0..255")
+        for b in data:
+            if not (0 <= b <= 0xFF):
+                raise ValueError("Data bytes must be 0..255")
+        self.bus.write_i2c_block_data(self.addr, reg, data)
+
+    def _read_bytes(self, reg: int, length: int) -> List[int]:
+        """
+        Read bytes using a 'write register pointer, then read' I2C transaction.
+        This avoids SMBus quirks and matches i2ctransfer behavior.
+        """
+        if not (0 <= reg <= 0xFF):
+            raise ValueError("Register must be 0..255")
+        if length <= 0:
+            raise ValueError("Length must be > 0")
+
+        w = i2c_msg.write(self.addr, [reg])
+        r = i2c_msg.read(self.addr, length)
+        self.bus.i2c_rdwr(w, r)
+        return list(r)
+
+    def _read_u8(self, reg: int) -> int:
+        """Read 1 byte from register reg."""
+        return self._read_bytes(reg, 1)[0]
+
+    def _read_u16_le(self, reg: int) -> int:
+        """Read 2 bytes from reg and return little-endian uint16."""
+        b = self._read_bytes(reg, 2)
+        return b[0] | (b[1] << 8)
+
+    # ----------------- Public API -----------------
+
+    def ping(self) -> bool:
+        """Returns True if the module responds on I2C (firmware register readable)."""
+        try:
+            _ = self.get_firmware_version()
+            return True
+        except OSError:
+            return False
+
+    def get_firmware_version(self) -> int:
+        """Read firmware version byte from 0xFE."""
+        return self._read_u8(FIRMWARE_VERSION_REG)
+
+    def get_i2c_address(self) -> int:
+        """Read current I2C address from 0xFF (if supported by firmware)."""
+        return self._read_u8(I2C_ADDRESS_REG)
+
+    def set_i2c_address(self, new_addr: int) -> None:
+        """
+        Set a new I2C address (if supported by firmware).
+        WARNING: After changing the address, you must talk to the module using the new address.
+        """
+        if not (0x03 <= new_addr <= 0x77):
+            raise ValueError("I2C address should be in 0x03..0x77")
+        self._write_bytes(I2C_ADDRESS_REG, [new_addr & 0xFF])
+        time.sleep(0.05)
+        self.addr = new_addr
+
+    def get_adc_12bit_value(self, channel: int) -> int:
+        """
+        Read the raw ADC 12-bit value for a channel.
+        Firmware typically stores it in 2 bytes (little-endian). Only lower 12 bits are meaningful.
+        """
+        self._check_channel(channel)
+        reg = MODULE_4_20MA_ADC_12BIT_REG + channel * 2
+        value = self._read_u16_le(reg)
+        return value & 0x0FFF
+
+    def get_current_raw(self, channel: int) -> int:
+        """
+        Read the raw current register for a channel (16-bit).
+        The scaling to mA depends on firmware; keep as raw unless you know the factor.
+        """
+        self._check_channel(channel)
+        reg = MODULE_4_20MA_CURRENT_REG + channel * 2
+        return self._read_u16_le(reg)
+
+    def get_cal_current(self, channel: int) -> int:
+        """Read calibration value for a channel (16-bit)."""
+        self._check_channel(channel)
+        reg = MODULE_4_20MA_CAL_REG + channel * 2
+        return self._read_u16_le(reg)
+
+    def set_cal_current(self, channel: int, value: int) -> None:
+        """
+        Write calibration value for a channel (16-bit, little-endian).
+        Firmware often needs a short delay after writing calibration.
+        """
+        self._check_channel(channel)
+        if not (0 <= value <= 0xFFFF):
+            raise ValueError("Calibration value must be 0..65535")
+
+        reg = MODULE_4_20MA_CAL_REG + channel * 2
+        low = value & 0xFF
+        high = (value >> 8) & 0xFF
+        self._write_bytes(reg, [low, high])
+        time.sleep(0.5)
+
+    def close(self) -> None:
+        """Close the I2C bus when you're done."""
+        self.bus.close()
+
+    # ----------------- Internals -----------------
+
+    @staticmethod
+    def _check_channel(channel: int) -> None:
+        if channel not in (0, 1, 2, 3):
+            raise ValueError("Channel must be 0, 1, 2, or 3")

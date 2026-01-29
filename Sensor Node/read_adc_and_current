@@ -1,0 +1,55 @@
+# read_adc_and_current.py
+import time
+from module_4_20ma import Module420mA
+
+VREF = 3.3  # ADC reference voltage
+
+
+def adc12_to_voltage(adc12: int) -> float:
+    """Convert 12-bit ADC value (0..4095) to volts."""
+    adc12 = max(0, min(4095, int(adc12)))
+    return (adc12 / 4095.0) * VREF
+
+
+def current_raw_to_mA(raw: int) -> float:
+    """
+    Convert module 'current raw' register to mA.
+    NOTE: raw/100.0 is a common convention (mA*100), but verify with a known current.
+    """
+    return raw / 100.0
+
+
+def main():
+    mod = Module420mA(bus=1, addr=0x55)
+
+    if not mod.ping():
+        print("❌ Module not found on I2C")
+        return
+
+    fw = mod.get_firmware_version()
+    print(f"✅ Module found, FW version: {fw}")
+    print("CH |   ADC |  Vadc (V) | Iraw  |  I (mA)")
+    print("-" * 46)
+
+    try:
+        while True:
+            for ch in range(4):
+                adc = mod.get_adc_12bit_value(ch)
+                v = adc12_to_voltage(adc)
+
+                i_raw = mod.get_current_raw(ch)      # <-- correct driver call
+                i_mA = current_raw_to_mA(i_raw)
+
+                print(f"{ch+1:>2} | {adc:>5} | {v:>8.3f} | {i_raw:>5} | {i_mA:>7.2f}")
+
+            print("-" * 46)
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        mod.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,46 @@
+import time
+from module_4_20ma import Module420mA
+
+
+def main():
+    mod = Module420mA(bus=1, addr=0x55)
+
+    if not mod.ping():
+        print("❌ Module not found on I2C")
+        return
+
+    print(f"✅ Module found, FW version: {mod.get_firmware_version()}")
+    print("Reading raw ADC values…")
+    print("-" * 60)
+
+    adc_min = 1_000_000
+    adc_max = 0
+
+    try:
+        for i in range(100):  # sample multiple times
+            for ch in range(4):
+                adc = mod.get_adc_12bit_value(ch)
+
+                adc_min = min(adc_min, adc)
+                adc_max = max(adc_max, adc)
+
+                print(f"Sample {i:02d} | CH{ch+1} | ADC raw = {adc}")
+
+            time.sleep(0.05)
+
+    finally:
+        mod.close()
+
+    print("-" * 60)
+    print(f"Observed ADC range: {adc_min} … {adc_max}")
+
+    if adc_max <= 4095:
+        print("✅ ADC behaves like a 12-bit value (0–4095)")
+    elif adc_max <= 65535:
+        print("⚠️ ADC behaves like a 16-bit scaled value (0–65535)")
+    else:
+        print("❓ ADC range unexpected — check driver or firmware")
+
+
+if __name__ == "__main__":
+    main()

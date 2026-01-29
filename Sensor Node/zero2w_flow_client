@@ -1,0 +1,176 @@
+
+# zero2w_flow_client.py
+#
+# Runs on Pi Zero 2 W
+# Reads two 4–20mA channels from M5Stack AIN4-20mA module
+# and sends flow data to Pi 4B over Bluetooth RFCOMM.
+#
+# Compatible with pi4_flow_display_gui.py:
+# - Sends JSON lines terminated by '\n'
+# - Keys: flow1_lpm, flow2_lpm, delta_lpm
+#
+# Reconnect behavior:
+# - Keeps trying forever if Pi4 is unreachable or connection drops
+# - Reconnects automatically after RECONNECT_DELAY
+
+import time
+import json
+import bluetooth
+from bluetooth import BluetoothSocket, RFCOMM
+
+from module_4_20ma import Module420mA
+
+# -------- CONFIG --------
+
+PI4_BT_MAC = "88:A2:9E:23:20:61"     # <-- replace with your Pi 4B BT MAC
+BT_PORT = 1                          # RFCOMM channel (must match server)
+RECONNECT_DELAY = 5.0                # seconds
+SEND_INTERVAL = 0.2                  # seconds (5 Hz)
+
+# Sensor calibration / mapping
+FLOW_MIN_LPM = 2.0
+FLOW_MAX_LPM = 100.0
+MA_MIN = 4.0
+MA_MAX = 20.0
+
+def current_to_flow_lpm(i_mA: float) -> float:
+    if i_mA <= MA_MIN:
+        return FLOW_MIN_LPM
+    if i_mA >= MA_MAX:
+        return FLOW_MAX_LPM
+    frac = (i_mA - MA_MIN) / (MA_MAX - MA_MIN)
+    return FLOW_MIN_LPM + frac * (FLOW_MAX_LPM - FLOW_MIN_LPM)
+
+
+# ------------------ BLUETOOTH CONNECT LOOP (UPDATED) ------------------
+
+def connect_loop():
+    """
+    Keep trying to connect to the Pi 4 forever.
+    Returns a connected BluetoothSocket.
+
+    Notes:
+    - Always creates a *fresh* socket per attempt (prevents 'bad fd' reuse)
+    - Handles common BlueZ errors like EBUSY (Errno 16)
+    """
+    while True:
+        sock = BluetoothSocket(RFCOMM)
+        try:
+            print(f"[BT] Connecting to Pi 4 at {PI4_BT_MAC} (channel {BT_PORT})...")
+            sock.connect((PI4_BT_MAC, BT_PORT))
+
+            # Make send fail quickly if link is dead (optional but helpful)
+            try:
+                sock.settimeout(5.0)
+            except Exception:
+                pass
+
+            print("[BT] Connected!")
+            return sock
+
+        except (bluetooth.btcommon.BluetoothError, OSError) as e:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+            retry = RECONNECT_DELAY
+            try:
+                if getattr(e, "errno", None) == 16:
+                    retry = max(RECONNECT_DELAY, 8.0)
+            except Exception:
+                pass
+
+            print(f"[BT] Connect failed: {e}")
+            print(f"[BT] Retrying in {retry} s...")
+            time.sleep(retry)
+
+
+# ------------------ MAIN (UNCHANGED) ------------------
+
+def main():
+    # Init I2C module once (UNCHANGED)
+    module = Module420mA(bus=1, addr=0x55)
+
+    if not module.ping():
+        print("❌ AIN4-20mA module not found on I2C (0x55). Check wiring / power.")
+        module.close()
+        return
+
+    print(f"✅ AIN4-20mA module detected. FW version: {module.get_firmware_version()}")
+
+    sock = None
+
+    try:
+        while True:
+            # Ensure we have a connection (keeps searching/retrying forever)
+            if sock is None:
+                sock = connect_loop()
+
+            try:
+                # --- READ DATA FROM MODULE (UNCHANGED) ---
+                raw0 = module.get_current_raw(0)   # Sensor 1 (CH0)
+                raw1 = module.get_current_raw(1)   # Sensor 2 (CH1)
+
+                i0 = raw0 / 100.0
+                i1 = raw1 / 100.0
+
+                q0 = current_to_flow_lpm(i0)
+                q1 = current_to_flow_lpm(i1)
+                # ---------------------------------------
+
+                payload = {
+                    "flow1_lpm": q0,
+                    "flow2_lpm": q1,
+                    "delta_lpm": (q1 - q0),
+
+                    "current_ch0_mA": i0,
+                    "current_ch1_mA": i1,
+                    "raw_ch0": raw0,
+                    "raw_ch1": raw1
+                }
+
+                line = json.dumps(payload) + "\n"
+                sock.send(line.encode("utf-8"))
+
+                print(
+                    f"Sent | "
+                    f"CH0: {i0:.2f} mA → {q0:.2f} L/min | "
+                    f"CH1: {i1:.2f} mA → {q1:.2f} L/min | "
+                    f"Δ: {(q1 - q0):.2f} L/min"
+                )
+
+                time.sleep(SEND_INTERVAL)
+
+            except (bluetooth.btcommon.BluetoothError, OSError) as e:
+                print(f"[BT] Disconnected: {e}")
+                try:
+                    if sock is not None:
+                        sock.close()
+                except Exception:
+                    pass
+                sock = None
+                print(f"[BT] Disconnected. Reconnecting in {RECONNECT_DELAY} s...")
+                time.sleep(RECONNECT_DELAY)
+
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                try:
+                    if sock is not None:
+                        sock.close()
+                except Exception:
+                    pass
+                sock = None
+                time.sleep(RECONNECT_DELAY)
+
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+        module.close()
+
+
+if __name__ == "__main__":
+    main()

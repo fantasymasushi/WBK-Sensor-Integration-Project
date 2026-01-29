@@ -1,0 +1,25 @@
+from module_4_20ma import Module420mA
+
+
+def main():
+    module = Module420mA()
+
+    try:
+        # 1. Check if the module responds
+        if not module.ping():
+            print("❌ Module not detected on I2C bus")
+            return
+
+        print("✅ Module detected")
+
+        # 2. Read firmware version
+        fw = module.get_firmware_version()
+        print("📦 Firmware version:", fw)
+
+    finally:
+        # 3. Always close the I2C bus
+        module.close()
+
+
+if __name__ == "__main__":
+    main()

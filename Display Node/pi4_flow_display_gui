@@ -1,0 +1,277 @@
+
+"""
+Ponticon Flow Monitor GUI (Raspberry Pi 4)
+
+- Receives JSON lines via Bluetooth RFCOMM and displays:
+  Ponticon Flow (CH0 / flow1_lpm), Delta, Source Flow (CH1 / flow2_lpm)
+
+GUI behavior:
+- One row: Ponticon Flow | Δ Flow | Source Flow
+- Centered content
+- Connection/status line below the flow values
+- When DISCONNECTED (or no valid data): show '-.--' for all flows (instead of 2.00 etc.)
+"""
+
+import json
+import queue
+import threading
+import tkinter as tk
+from tkinter import ttk
+
+from bluetooth import BluetoothSocket, RFCOMM
+
+# ---------- CONFIG ----------
+BT_PORT = 1
+
+# thresholds for color
+DELTA_GREEN = 2.0     # |Δ| < 2  → green
+DELTA_YELLOW = 6.0    # 2 ≤ |Δ| < 6 → yellow
+# else → red
+
+# What to show when there is no valid data (disconnected/stale)
+NO_DATA_TEXT = "-.--"
+
+# ---------- GLOBALS ----------
+data_queue = queue.Queue()
+latest_data = {
+    "flow1_lpm": None,
+    "flow2_lpm": None,
+    "delta_lpm": None,
+    "status": "Waiting for Zero 2 W..."
+}
+
+
+# ---------- BLUETOOTH SERVER (UNCHANGED) ----------
+
+def bt_server_thread():
+    """
+    Runs in a background thread:
+    - accepts RFCOMM connection on BT_PORT
+    - receives JSON lines terminated by '\n'
+    - pushes parsed payloads into data_queue
+
+    Resilient behavior:
+    - If the client disconnects, it closes the client socket
+      and goes back to accept() without needing to restart the GUI.
+    """
+    server_sock = BluetoothSocket(RFCOMM)
+
+    # Helps re-bind faster on some systems
+    try:
+        import socket as _socket
+        server_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    except Exception:
+        pass
+
+    server_sock.bind(("", BT_PORT))
+    server_sock.listen(1)
+
+    print(f"[BT] Listening on RFCOMM channel {BT_PORT}...")
+    data_queue.put({"status": "Waiting for Zero 2 W..."})
+
+    while True:
+        client_sock = None
+        try:
+            client_sock, client_info = server_sock.accept()
+            print("[BT] Accepted connection from", client_info)
+
+            # Connected status update
+            data_queue.put({"status": f"Connected: {client_info[0]}"})
+
+            try:
+                client_sock.settimeout(1.0)
+            except Exception:
+                pass
+
+            buffer = b""
+            while True:
+                try:
+                    chunk = client_sock.recv(1024)
+                    if not chunk:
+                        raise ConnectionResetError("Client disconnected")
+
+                    buffer += chunk
+
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        try:
+                            payload = json.loads(line.decode("utf-8"))
+                            data_queue.put(payload)
+                        except json.JSONDecodeError:
+                            # ignore malformed json lines
+                            continue
+
+                except TimeoutError:
+                    continue
+
+        except Exception as e:
+            print(f"[BT] Client disconnected / error: {e}")
+
+            # IMPORTANT GUI BEHAVIOR CHANGE:
+            # When disconnected, clear the latest flow values so GUI shows '-.--'
+            data_queue.put({
+                "status": "Waiting for Zero 2 W...",
+                "flow1_lpm": None,
+                "flow2_lpm": None,
+                "delta_lpm": None
+            })
+
+        finally:
+            try:
+                if client_sock is not None:
+                    client_sock.close()
+            except Exception:
+                pass
+
+
+# ---------- UI BUILD ----------
+
+def make_ui(root):
+    """Build the Tkinter UI and return a dict of widgets to be updated."""
+    root.title("Ponticon Flow Monitor")
+    root.geometry("900x450")
+    root.configure(bg="black")
+
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("Title.TLabel", font=("Helvetica", 22, "bold"),
+                    background="black", foreground="white")
+    style.configure("Header.TLabel", font=("Helvetica", 24, "bold"),
+                    background="black", foreground="white")
+    style.configure("Value.TLabel", font=("Helvetica", 60, "bold"),
+                    background="black", foreground="white")
+    style.configure("Unit.TLabel", font=("Helvetica", 18),
+                    background="black", foreground="white")
+    style.configure("Status.TLabel", font=("Helvetica", 14),
+                    background="black", foreground="gray")
+
+    main_frame = ttk.Frame(root, padding=40)
+    main_frame.pack(expand=True, fill="both")
+
+    # Make the grid expand and keep the content centered
+    for c in range(3):
+        main_frame.columnconfigure(c, weight=1, uniform="col")
+    for r in range(5):  # title, labels, values, units, status
+        main_frame.rowconfigure(r, weight=1)
+
+    # Title (top, centered)
+    title_lbl = ttk.Label(main_frame, text="Ponticon Flow Monitor", style="Header.TLabel")
+    title_lbl.grid(row=0, column=0, columnspan=3, pady=(0, 10), sticky="n")
+
+    # ---- One row: Ponticon | Delta | Source ----
+
+    # Ponticon (CH0 / flow1_lpm)
+    lbl_ponticon = ttk.Label(main_frame, text="Ponticon Flow", style="Title.TLabel")
+    lbl_ponticon.grid(row=1, column=0, pady=(0, 6))
+
+    val_ponticon = ttk.Label(main_frame, text=NO_DATA_TEXT, style="Value.TLabel")
+    val_ponticon.grid(row=2, column=0)
+
+    unit_ponticon = ttk.Label(main_frame, text="L/min", style="Unit.TLabel")
+    unit_ponticon.grid(row=3, column=0)
+
+    # Delta (center)
+    lbl_delta = ttk.Label(main_frame, text="Δ Flow", style="Title.TLabel")
+    lbl_delta.grid(row=1, column=1, pady=(0, 6))
+
+    val_delta = tk.Label(
+        main_frame,
+        text=NO_DATA_TEXT,
+        font=("Helvetica", 60, "bold"),
+        bg="black",
+        fg="white"
+    )
+    val_delta.grid(row=2, column=1)
+
+    unit_delta = ttk.Label(main_frame, text="L/min", style="Unit.TLabel")
+    unit_delta.grid(row=3, column=1)
+
+    # Source (CH1 / flow2_lpm)
+    lbl_source = ttk.Label(main_frame, text="Source Flow", style="Title.TLabel")
+    lbl_source.grid(row=1, column=2, pady=(0, 6))
+
+    val_source = ttk.Label(main_frame, text=NO_DATA_TEXT, style="Value.TLabel")
+    val_source.grid(row=2, column=2)
+
+    unit_source = ttk.Label(main_frame, text="L/min", style="Unit.TLabel")
+    unit_source.grid(row=3, column=2)
+
+    # Status line (below flows, centered)
+    status_lbl = ttk.Label(main_frame, text="Waiting...", style="Status.TLabel")
+    status_lbl.grid(row=4, column=0, columnspan=3, pady=(12, 0), sticky="s")
+
+    return {
+        "status": status_lbl,
+        "ponticon": val_ponticon,  # flow1_lpm
+        "source": val_source,      # flow2_lpm
+        "delta": val_delta
+    }
+
+
+def update_ui(root, widgets):
+    """Periodically pull from data_queue and update displayed values."""
+    global latest_data
+
+    try:
+        while True:
+            payload = data_queue.get_nowait()
+            latest_data.update(payload)
+    except queue.Empty:
+        pass
+
+    # Update status
+    if latest_data.get("status"):
+        widgets["status"].config(text=latest_data["status"])
+
+    ponticon = latest_data.get("flow1_lpm")
+    source = latest_data.get("flow2_lpm")
+    d = latest_data.get("delta_lpm")
+
+    # If we have no valid value, show '-.--'
+    if ponticon is None:
+        widgets["ponticon"].config(text=NO_DATA_TEXT)
+    else:
+        widgets["ponticon"].config(text=f"{ponticon:0.2f}")
+
+    if source is None:
+        widgets["source"].config(text=NO_DATA_TEXT)
+    else:
+        widgets["source"].config(text=f"{source:0.2f}")
+
+    if d is None:
+        widgets["delta"].config(text=NO_DATA_TEXT, fg="white")
+    else:
+        widgets["delta"].config(text=f"{d:0.2f}")
+
+        ad = abs(d)
+        if ad < DELTA_GREEN:
+            color = "lime"
+        elif ad < DELTA_YELLOW:
+            color = "yellow"
+        else:
+            color = "red"
+        widgets["delta"].config(fg=color)
+
+    root.after(100, update_ui, root, widgets)
+
+
+def main():
+    root = tk.Tk()
+    widgets = make_ui(root)
+
+    # Start Bluetooth server thread (UNCHANGED)
+    t = threading.Thread(target=bt_server_thread, daemon=True)
+    t.start()
+
+    # Start periodic UI update
+    root.after(100, update_ui, root, widgets)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

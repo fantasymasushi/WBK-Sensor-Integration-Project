@@ -1,0 +1,73 @@
+# zero2w_flow_local.py
+#
+# Runs on Raspberry Pi Zero 2 W.
+# Reads 2 FESTO SFAH sensors via M5Stack AIN4-20mA module (channels 0 and 1)
+# and prints flow (L/min) locally (no Bluetooth).
+#
+# Assumptions:
+# - Module current register reports mA * 100 (so mA = raw / 100.0)
+# - Flow scaling: 4–20 mA -> 2–100 L/min
+
+import time
+from module_4_20ma import Module420mA
+
+# -------- CONFIG --------
+FLOW_MIN_LPM = 2.0
+FLOW_MAX_LPM = 100.0
+CURR_MIN_MA = 4.0
+CURR_MAX_MA = 20.0
+
+PRINT_INTERVAL = 0.2  # seconds (5 Hz)
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(x, hi))
+
+
+def current_to_flow_lpm(i_mA: float) -> float:
+    """Map 4–20 mA to 2–100 L/min (with clamping)."""
+    i_mA = clamp(i_mA, CURR_MIN_MA, CURR_MAX_MA)
+    return FLOW_MIN_LPM + (i_mA - CURR_MIN_MA) * (FLOW_MAX_LPM - FLOW_MIN_LPM) / (CURR_MAX_MA - CURR_MIN_MA)
+
+
+def main():
+    module = Module420mA(bus=1, addr=0x55)
+
+    if not module.ping():
+        print("❌ AIN4-20mA module not found on I2C (0x55). Check wiring / power.")
+        module.close()
+        return
+
+    print(f"✅ AIN4-20mA module detected. FW version: {module.get_firmware_version()}")
+    print("Press Ctrl+C to stop.")
+    print("-" * 70)
+    print(" CH |  Iraw  |  I (mA) |  Flow (L/min)")
+    print("-" * 70)
+
+    try:
+        while True:
+            raw0 = module.get_current_raw(0)
+            raw1 = module.get_current_raw(1)
+
+            i0 = raw0 / 100.0
+            i1 = raw1 / 100.0
+
+            q0 = current_to_flow_lpm(i0)
+            q1 = current_to_flow_lpm(i1)
+
+            # Print one line per channel
+            print(f"  1 | {raw0:5d} | {i0:6.2f} | {q0:11.2f}")
+            print(f"  2 | {raw1:5d} | {i1:6.2f} | {q1:11.2f}")
+            print("-" * 70)
+
+            time.sleep(PRINT_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+
+    finally:
+        module.close()
+
+
+if __name__ == "__main__":
+    main()

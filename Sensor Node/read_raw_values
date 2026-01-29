@@ -1,0 +1,16 @@
+
+import time
+from m5_4_20ma import M5Module420mA
+
+m = M5Module420mA()
+print("Reading raw values...")
+try:
+    while True:
+        raw0 = m.get_current_raw(0)
+        raw1 = m.get_current_raw(1)
+        print(f"CH0 raw={raw0}   CH1 raw={raw1}")
+        time.sleep(0.5)
+except KeyboardInterrupt:
+    pass
+finally:
+    m.close()
