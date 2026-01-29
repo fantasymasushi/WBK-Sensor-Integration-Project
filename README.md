@@ -6,7 +6,7 @@ Ponticon Flow Monitoring System – Code Overview
 
 This repository contains Python scripts for a distributed 4–20 mA flow monitoring system based on:
 
-Raspberry Pi Zero 2 W (sensor node)
+Raspberry Pi 4 (sensor node)
 
 Raspberry Pi 4 (display node)
 
